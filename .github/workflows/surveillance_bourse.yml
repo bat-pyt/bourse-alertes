@@ -1,0 +1,30 @@
+name: Surveillance Bourse Temps Reel
+
+on:
+  # Déclenchement automatique du lundi au vendredi à 07h00 UTC (09h00 Paris)
+  schedule:
+    - cron: '0 7 * * 1-5'
+  # Permet également de lancer le robot manuellement depuis le site GitHub en 1 clic
+  workflow_dispatch:
+
+jobs:
+  scanner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Récupération du code
+        uses: actions/checkout@v4
+
+      - name: Configuration de Python
+        uses: setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Installation des dépendances
+        run: |
+          pip install requests yfinance pandas
+
+      - name: Exécution du moteur de surveillance boursière
+        run: |
+          python alerte_github.py
