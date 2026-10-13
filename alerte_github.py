@@ -16,8 +16,9 @@ SEUIL_STOP_LOSS_PRU = -1.5
 
 # Fréquence de scan en secondes
 CHECK_INTERVAL_SECONDS = 90
-# Durée maximale d'exécution d'un job GitHub en minutes (ex: 300 min = 5 heures)
-MAX_RUN_MINUTES = 330  # S'arrête proprement avant la limite des 6 heures de GitHub
+# Durée maximale d'exécution d'un job GitHub en minutes
+# 330 min (5h30) pour couvrir de 09h00 à 14h30 (Session 1), et de 14h30 à 22h00 clôture US (Session 2 : 450 min)
+MAX_RUN_MINUTES = 450  # S'arrête proprement à la fermeture des marchés US (22h00 Paris)
 
 
 MES_POSITIONS = [

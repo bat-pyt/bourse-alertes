@@ -1,9 +1,12 @@
 name: Surveillance Bourse Temps Reel
 
 on:
-  # Déclenchement automatique du lundi au vendredi à 07h00 UTC (09h00 Paris)
+  # Déclenchements automatiques du lundi au vendredi :
+  # Session 1 (Paris) : 07h00 UTC = 09h00 Paris (ouverture Euronext)
+  # Session 2 (US / Clôture) : 12h30 UTC = 14h30 Paris (prépare 15h30 US et couvre jusqu'à 20h00 UTC = 22h00 clôture US)
   schedule:
     - cron: '0 7 * * 1-5'
+    - cron: '30 12 * * 1-5'
   # Permet également de lancer le robot manuellement depuis le site GitHub en 1 clic
   workflow_dispatch:
 
