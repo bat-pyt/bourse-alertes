@@ -25,8 +25,11 @@ jobs:
 
       - name: Installation des dépendances
         run: |
-          pip install requests yfinance pandas
+          pip install requests yfinance pandas cloudscraper beautifulsoup4
 
       - name: Exécution du moteur de surveillance boursière
+        env:
+          JEU_PSEUDO: ${{ secrets.JEU_PSEUDO }}
+          JEU_PASSWORD: ${{ secrets.JEU_PASSWORD }}
         run: |
           python alerte_github.py
