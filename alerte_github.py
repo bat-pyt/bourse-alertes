@@ -3,7 +3,8 @@ import sys
 import time
 import json
 import re
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from datetime import datetime, date
 import requests
 import yfinance as yf
 from bs4 import BeautifulSoup
@@ -11,23 +12,20 @@ from bs4 import BeautifulSoup
 # Canal Ntfy
 NTFY_URL = "https://ntfy.sh/alertebourse"
 
-# Seuil de hausse sur 15 min réelles pour arbitrage
-SEUIL_HAUSSE_15MIN = 0.65
-# Seuil de stop-loss sur PRU
-SEUIL_STOP_LOSS_PRU = -1.5
+# Seuils de surveillance
+SEUIL_STOP_LOSS_PRU = -1.5        # Stop-loss strict sur prix d'achat PRU
+SEUIL_TRAILING_STOP_REPLI = 1.0   # Si une position a fait > +3%, alerte si repli de plus de 1%
+SEUIL_MOMENTUM_JOUR = 2.0         # Alerte si une action du vivier explose de plus de +2% avec cassure
 
-# Fréquence de scan en secondes
 CHECK_INTERVAL_SECONDS = 90
-# Durée maximale d'un job GitHub en minutes
-MAX_RUN_MINUTES = 450  # Couvre jusqu'à la fermeture des marchés US
+MAX_RUN_MINUTES = 450             # Couvre jusqu'à la fermeture des marchés US
 
-# Identifiants lus depuis les Secrets GitHub
 JEU_PSEUDO = os.environ.get("JEU_PSEUDO", "WarrenBuffett")
 JEU_PASSWORD = os.environ.get("JEU_PASSWORD", "")
 BASE_URL = "https://jeuboursiercreditagricole.abcbourse.com"
 GAME_NAME = "alpes-provence"
 
-# Positions par défaut en fallback si pas de mot de passe configuré
+# Positions par défaut
 POSITIONS_PAR_DEFAUT = [
     {"symbol": "GOOG", "name": "Alphabet C", "pru": 349.934},
     {"symbol": "ALO.PA", "name": "Alstom", "pru": 15.719},
@@ -100,13 +98,18 @@ ACTIONS_DISPONIBLES = [
     {"symbol": "SESG.PA", "name": "SES Imagotag"},
 ]
 
+# Mémoire des actualités et alertes déjà envoyées pour éviter les doublons
+actualites_deja_notifiees = set()
+evenements_calendrier_notifies = set()
+plus_hauts_positions = {}
 
-def notifier_mobile(titre: str, message: str, priority: str = "high"):
+
+def notifier_mobile(titre: str, message: str, priority: str = "high", tags: str = "chart_with_upwards_trend,rocket"):
     try:
         headers = {
             "Title": titre.encode("utf-8"),
             "Priority": priority,
-            "Tags": "chart_with_upwards_trend,rocket"
+            "Tags": tags
         }
         requests.post(NTFY_URL, data=message.encode("utf-8"), headers=headers, timeout=5)
         print(f"[NOTIF ENVOYÉE] {titre} - {message}")
@@ -117,7 +120,6 @@ def notifier_mobile(titre: str, message: str, priority: str = "high"):
 def synchroniser_portefeuille_jeu():
     """Se connecte au jeu boursier et récupère vos vraies positions à jour."""
     if not JEU_PASSWORD:
-        print("[i] JEU_PASSWORD non configuré. Utilisation des positions en mémoire.")
         return POSITIONS_PAR_DEFAUT
 
     try:
@@ -137,12 +139,10 @@ def synchroniser_portefeuille_jeu():
             "X-Requested-With": "XMLHttpRequest"
         }
 
-        print(f"[*] Connexion au jeu boursier pour {JEU_PSEUDO}...")
         resp = scraper.post(login_url, json=payload, headers=headers)
         if resp.status_code != 200:
             return POSITIONS_PAR_DEFAUT
 
-        # Accès à la page du portefeuille
         r_port = scraper.get(f"{BASE_URL}/game/{GAME_NAME}/portfolio")
         if r_port.status_code != 200:
             return POSITIONS_PAR_DEFAUT
@@ -150,7 +150,6 @@ def synchroniser_portefeuille_jeu():
         soup = BeautifulSoup(r_port.text, "html.parser")
         positions_trouvees = []
 
-        # Analyse des lignes de tableau contenant des liens 'cotation-'
         for tr in soup.find_all("tr"):
             a_tag = tr.find("a", href=re.compile(r"cotation-"))
             if not a_tag:
@@ -160,18 +159,15 @@ def synchroniser_portefeuille_jeu():
             short_id = href.split("cotation-")[-1]
             nom = a_tag.get_text(strip=True)
 
-            # Conversion ticker Yahoo
             ticker_yf = short_id
             if short_id.endswith("p"):
                 ticker_yf = short_id[:-1] + ".PA"
             elif short_id.endswith("u"):
                 ticker_yf = short_id[:-1]
 
-            # Extraction du PRU (prix de revient)
             cols = [td.get_text(strip=True) for td in tr.find_all("td")]
             pru_val = None
             for c in cols:
-                # Cherche un nombre flottant type '15,719' ou '349,93'
                 match = re.search(r"^\d+([.,]\d+)?$", c)
                 if match:
                     try:
@@ -187,16 +183,123 @@ def synchroniser_portefeuille_jeu():
             })
 
         if positions_trouvees:
-            print(f"[+] Synchronisation réussie : {len(positions_trouvees)} positions trouvées sur votre compte !")
             return positions_trouvees
 
     except Exception as e:
-        print(f"[!] Erreur synchronisation portefeuille : {e}")
+        print(f"[!] Erreur synchronisation : {e}")
 
     return POSITIONS_PAR_DEFAUT
 
 
+def verifier_calendrier_financier(positions_actuelles):
+    """
+    Vérifie les dates de résultats financiers et détachements de dividendes
+    imminents pour vos actions (dans les 7 prochains jours).
+    """
+    print("[*] Vérification du calendrier financier (Résultats & Dividendes)...")
+    aujourdhui = date.today()
+
+    for item in positions_actuelles:
+        sym = item["symbol"]
+        nom = item["name"]
+
+        try:
+            t = yf.Ticker(sym)
+            cal = t.calendar
+            if not cal:
+                continue
+
+            # 1. Vérification des résultats (Earnings)
+            earnings = cal.get("Earnings Date")
+            if earnings:
+                e_date = earnings[0] if isinstance(earnings, list) else earnings
+                if isinstance(e_date, datetime):
+                    e_date = e_date.date()
+                
+                if isinstance(e_date, date):
+                    jours_restants = (e_date - aujourdhui).days
+                    cle = f"{sym}_earnings_{e_date}"
+                    if 0 <= jours_restants <= 5 and cle not in evenements_calendrier_notifies:
+                        evenements_calendrier_notifies.add(cle)
+                        msg_date = "AUJOURD'HUI !" if jours_restants == 0 else f"dans {jours_restants} jour(s) ({e_date.strftime('%d/%m')})"
+                        notifier_mobile(
+                            f"📅 RÉSULTATS : {nom}",
+                            f"Publication des résultats financiers {msg_date}. Forte volatilité attendue !",
+                            priority="high",
+                            tags="calendar,warning"
+                        )
+
+            # 2. Vérification des dividendes (Ex-Dividend Date)
+            ex_div = cal.get("Ex-Dividend Date")
+            if ex_div:
+                if isinstance(ex_div, datetime):
+                    ex_div = ex_div.date()
+                if isinstance(ex_div, date):
+                    jours_div = (ex_div - aujourdhui).days
+                    cle = f"{sym}_div_{ex_div}"
+                    if 0 <= jours_div <= 5 and cle not in evenements_calendrier_notifies:
+                        evenements_calendrier_notifies.add(cle)
+                        msg_div = "AUJOURD'HUI" if jours_div == 0 else f"le {ex_div.strftime('%d/%m')}"
+                        notifier_mobile(
+                            f"💰 DIVIDENDE : {nom}",
+                            f"Détachement du dividende prévu {msg_div}. Le cours sera ajusté à l'ouverture.",
+                            priority="default",
+                            tags="moneybag,bell"
+                        )
+
+        except Exception:
+            pass
+
+
+def surveiller_actualites_en_direct(positions_actuelles):
+    """
+    Scanne les flux d'actualités financières (Google News FR) pour détecter
+    les annonces de résultats, contrats, notes d'analystes ou avertissements.
+    """
+    noms_a_surveiller = [p["name"] for p in positions_actuelles]
+    if not noms_a_surveiller:
+        return
+
+    # Recherche combinée des mots-clés boursiers importants
+    query = "+OR+".join([n.replace(" ", "+") for n in noms_a_surveiller[:6]])
+    url = f"https://news.google.com/rss/search?q=({query})+(résultats+OR+bénéfice+OR+chiffre+d'affaires+OR+contrat+OR+dividende+OR+recommandation)+when:1d&hl=fr&gl=FR&ceid=FR:fr"
+
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            return
+
+        root = ET.fromstring(r.content)
+        items = root.findall(".//item")
+
+        for it in items[:15]:
+            titre = it.find("title").text if it.find("title") is not None else ""
+            if not titre or titre in actualites_deja_notifiees:
+                continue
+
+            # Vérifie si le titre concerne explicitement une de nos actions
+            for nom in noms_a_surveiller:
+                # Recherche du nom dans le titre (insensible à la casse)
+                if re.search(r"\b" + re.escape(nom) + r"\b", titre, re.IGNORECASE):
+                    actualites_deja_notifiees.add(titre)
+                    notifier_mobile(
+                        f"📰 ACTUALITÉ : {nom}",
+                        titre,
+                        priority="default",
+                        tags="newspaper,mega"
+                    )
+                    break
+
+    except Exception as e:
+        print(f"[!] Erreur scan actualités : {e}")
+
+
 def verifier_positions(positions_actuelles):
+    """
+    Surveillance stricte du portefeuille :
+    1. Stop-Loss PRU (couper si <= -1.5%).
+    2. Trailing Stop (sécuriser les gains si un gros gagnant décroche).
+    """
     symbols = [p["symbol"] for p in positions_actuelles]
     try:
         data = yf.download(symbols, period="5d", progress=False)
@@ -217,69 +320,118 @@ def verifier_positions(positions_actuelles):
 
             if pru:
                 gain_pru = ((cours_actuel - pru) / pru) * 100
+
+                # 1. Alerte Stop-Loss strict
                 if gain_pru <= SEUIL_STOP_LOSS_PRU:
                     notifier_mobile(
                         f"🚨 STOP-LOSS : {nom}",
-                        f"Cours: {cours_actuel:.2f}€. Perte sur PRU: {gain_pru:.2f}% (Seuil {SEUIL_STOP_LOSS_PRU}%)."
+                        f"Cours: {cours_actuel:.2f}€. Perte sur PRU: {gain_pru:.2f}% (Seuil {SEUIL_STOP_LOSS_PRU}%). Coupez pour préserver le capital !",
+                        priority="urgent",
+                        tags="rotating_light,x"
                     )
+
+                # 2. Trailing Stop (sécurisation des plus-values)
+                max_connu = plus_hauts_positions.get(sym, gain_pru)
+                if gain_pru > max_connu:
+                    plus_hauts_positions[sym] = gain_pru
+                    max_connu = gain_pru
+
+                # Si la position a fait au moins +3% et qu'elle décroche de plus de 1% depuis son sommet
+                if max_connu >= 3.0 and (max_connu - gain_pru) >= SEUIL_TRAILING_STOP_REPLI:
+                    notifier_mobile(
+                        f"🎯 SÉCURISER GAINS : {nom}",
+                        f"Gain actuel: +{gain_pru:.2f}% (était monté à +{max_connu:.2f}%). Repli constaté, pensez à encaisser !",
+                        priority="high",
+                        tags="money_with_wings,bell"
+                    )
+                    # Remet à niveau le max pour ne pas spammer
+                    plus_hauts_positions[sym] = gain_pru
+
     except Exception as e:
         print(f"[!] Erreur portefeuille : {e}")
 
 
-def scanner_arbitrage():
+def scanner_momentum_et_breakouts():
+    """
+    Scanne l'univers d'investissement pour détecter les fusées du jour (Momentum >= +2%).
+    """
     dict_actions = {a["symbol"]: a["name"] for a in ACTIONS_DISPONIBLES}
     symbols = list(dict_actions.keys())
 
     try:
-        df = yf.download(symbols, period="1d", interval="1m", progress=False)
-        if df.empty or "Close" not in df:
+        data = yf.download(symbols, period="5d", progress=False)
+        if data.empty or "Close" not in data:
             return
 
-        close_df = df["Close"].ffill()
-        if len(close_df) < 16:
-            return
+        close_df = data["Close"].ffill()
+        for sym, nom in dict_actions.items():
+            if sym not in close_df or len(close_df[sym].dropna()) < 2:
+                continue
 
-        prix_actuels = close_df.iloc[-1]
-        prix_il_y_a_15m = close_df.iloc[-16]
-        variations_15m = ((prix_actuels - prix_il_y_a_15m) / prix_il_y_a_15m) * 100
+            serie = close_df[sym].dropna()
+            cours_actuel = serie.iloc[-1]
+            cours_veille = serie.iloc[-2]
 
-        for sym, var_15m in variations_15m.items():
-            if var_15m is not None and not (var_15m != var_15m):
-                if var_15m >= SEUIL_HAUSSE_15MIN:
-                    nom = dict_actions.get(sym, sym)
-                    p_now = prix_actuels.get(sym, 0.0)
-                    p_old = prix_il_y_a_15m.get(sym, 0.0)
+            var_jour = ((cours_actuel - cours_veille) / cours_veille) * 100
+
+            if var_jour >= SEUIL_MOMENTUM_JOUR:
+                # Alerte momentum fort
+                cle_mom = f"mom_{sym}_{date.today()}"
+                if cle_mom not in actualites_deja_notifiees:
+                    actualites_deja_notifiees.add(cle_mom)
                     notifier_mobile(
-                        f"🚀 ACHAT JEU : {nom}",
-                        f"+{var_15m:.2f}% en 15m ! Cours direct: {p_now:.2f}€ vs jeu ~{p_old:.2f}€"
+                        f"🚀 MOMENTUM FORT : {nom}",
+                        f"+{var_jour:.2f}% aujourd'hui (cours: {cours_actuel:.2f}€). Forte impulsion haussière !",
+                        priority="high",
+                        tags="fire,chart_with_upwards_trend"
                     )
+
     except Exception as e:
-        print(f"[!] Erreur scan : {e}")
+        print(f"[!] Erreur scan momentum : {e}")
 
 
 def main():
     print(f"=== Surveillance GitHub démarrée : {datetime.now()} ===")
     
-    # Récupère automatiquement vos vraies positions à jour
     positions_suivies = synchroniser_portefeuille_jeu()
     
     notifier_mobile(
-        "🤖 GitHub Bot Démarré", 
-        f"Surveillance active de {len(positions_suivies)} positions en direct + scan arbitrage 15 min !"
+        "🤖 Scanner Bourse & Actualités Actif", 
+        f"Surveillance de {len(positions_suivies)} positions en direct (Résultats, Dividendes, News, Stop-Loss et Momentum)",
+        priority="default",
+        tags="white_check_mark,robot"
     )
+
+    # Vérification initiale du calendrier financier
+    verifier_calendrier_financier(positions_suivies)
+    surveiller_actualites_en_direct(positions_suivies)
 
     t_start = time.time()
     dernier_sync = time.time()
+    dernier_scan_news = time.time()
+    dernier_scan_cal = time.time()
 
     while (time.time() - t_start) < (MAX_RUN_MINUTES * 60):
-        # Resynchronise automatiquement les positions toutes les 30 minutes
-        if (time.time() - dernier_sync) > 1800:
-            positions_suivies = synchroniser_portefeuille_jeu()
-            dernier_sync = time.time()
+        t_actuel = time.time()
 
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle d'analyse ({len(positions_suivies)} positions suivies)...")
+        # Resynchronisation du portefeuille toutes les 30 minutes
+        if (t_actuel - dernier_sync) > 1800:
+            positions_suivies = synchroniser_portefeuille_jeu()
+            dernier_sync = t_actuel
+
+        # Scan des actualités financières toutes les 15 minutes
+        if (t_actuel - dernier_scan_news) > 900:
+            surveiller_actualites_en_direct(positions_suivies)
+            dernier_scan_news = t_actuel
+
+        # Vérification du calendrier financier toutes les 2 heures
+        if (t_actuel - dernier_scan_cal) > 7200:
+            verifier_calendrier_financier(positions_suivies)
+            dernier_scan_cal = t_actuel
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Cycle d'analyse ({len(positions_suivies)} positions)...")
         verifier_positions(positions_suivies)
-        scanner_arbitrage()
+        scanner_momentum_et_breakouts()
         time.sleep(CHECK_INTERVAL_SECONDS)
 
     print("=== Fin de la session GitHub (rotation) ===")
